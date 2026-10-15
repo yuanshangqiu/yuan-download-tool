@@ -5,7 +5,7 @@
 # 云析桌面版 · YunX-Desktop
 
 **粘贴分享链接，直接高速下载 —— 云析 YunX 的 Windows 桌面移植**
-
+新增本地提交记录，贡献者 yuanshangqiu
 识别夸克 / UC / 迅雷 / 百度 / 139 / 123 分享链接，自动匹配提取码，Range 分片并发 + 断点续传。
 
 [![Release](https://img.shields.io/github/v/release/tidain/YunX-Desktop?style=flat-square\&label=release\&color=4C8BF5)](https://github.com/tidain/YunX-Desktop/releases/latest)
