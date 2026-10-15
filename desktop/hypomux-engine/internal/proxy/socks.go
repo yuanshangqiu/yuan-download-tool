@@ -1,0 +1,163 @@
+package proxy
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"strconv"
+	"syscall"
+)
+
+func (s *Server) handleSOCKS(reader *bufio.Reader, client net.Conn, session *connection) *Adapter {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(reader, header); err != nil || header[0] != 5 {
+		return nil
+	}
+	methods := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(reader, methods); err != nil {
+		return nil
+	}
+	supportsNoAuth := false
+	for _, method := range methods {
+		if method == 0 {
+			supportsNoAuth = true
+			break
+		}
+	}
+	if !supportsNoAuth {
+		_, _ = client.Write([]byte{5, 0xff})
+		return nil
+	}
+	if _, err := client.Write([]byte{5, 0}); err != nil {
+		return nil
+	}
+
+	request := make([]byte, 4)
+	if _, err := io.ReadFull(reader, request); err != nil || request[0] != 5 {
+		return nil
+	}
+	host, ok := readSOCKSHost(reader, request[3])
+	if !ok {
+		writeSOCKSReply(client, 8)
+		return nil
+	}
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(reader, portBytes); err != nil {
+		return nil
+	}
+	port := int(binary.BigEndian.Uint16(portBytes))
+	if request[1] == 3 {
+		if session.channel == "" {
+			writeSOCKSReply(client, 7)
+			return nil
+		}
+		started, err := s.handleUDPAssociation(reader, client, session, host, port)
+		if err != nil && !started {
+			writeSOCKSReply(client, 1)
+		}
+		return nil
+	}
+	if request[1] != 1 {
+		writeSOCKSReply(client, 7)
+		return nil
+	}
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	upstream, adapter, err := s.connect(session, target)
+	if err != nil {
+		reply := socksConnectFailureReply(err)
+		writeSOCKSReply(client, reply)
+		s.reportConnectFailure(session.channel, target, err, reply)
+		return nil
+	}
+	if !writeSOCKSReply(client, 0) {
+		_ = upstream.Close()
+		return nil
+	}
+	cdnHost := host
+	if session.channel != ChannelDirect && s.cdn.active() {
+		if net.ParseIP(host) != nil {
+			cdnHost = sniffSteamHost(reader, client, strconv.Itoa(port))
+		} else if port == 80 && steamDownloadHost(host) {
+			if sniffSteamHost(reader, client, "80") != normalizeDomain(host) {
+				cdnHost = ""
+			}
+		}
+	}
+	upstream = s.prepareSteamCDN(session, upstream, adapter, cdnHost, strconv.Itoa(port), peekSteamChunkPath(reader))
+	s.relay(reader, client, upstream, session)
+	return &adapter
+}
+
+func socksConnectFailureReply(err error) byte {
+	// Multiple adapters can fail for different reasons. Do not claim the
+	// destination refused the connection when only one attempt did.
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		code := byte(0)
+		for _, cause := range joined.Unwrap() {
+			next := socksConnectFailureReply(cause)
+			if code != 0 && code != next {
+				return 1
+			}
+			code = next
+		}
+		if code != 0 {
+			return code
+		}
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok && wrapped.Unwrap() != nil {
+		return socksConnectFailureReply(wrapped.Unwrap())
+	}
+	var networkError net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkError) && networkError.Timeout()) {
+		return 6
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.Errno(10061)) {
+		return 5
+	}
+	if errors.Is(err, syscall.ENETUNREACH) || errors.Is(err, syscall.Errno(10051)) {
+		return 3
+	}
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.Errno(10065)) {
+		return 4
+	}
+	return 1
+}
+
+func readSOCKSHost(reader *bufio.Reader, addressType byte) (string, bool) {
+	switch addressType {
+	case 1:
+		value := make([]byte, net.IPv4len)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return "", false
+		}
+		return net.IP(value).String(), true
+	case 3:
+		length, err := reader.ReadByte()
+		if err != nil || length == 0 {
+			return "", false
+		}
+		value := make([]byte, int(length))
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return "", false
+		}
+		return string(value), true
+	case 4:
+		value := make([]byte, net.IPv6len)
+		if _, err := io.ReadFull(reader, value); err != nil {
+			return "", false
+		}
+		// IPv6 egress is a later migration slice; parse it so the caller gets a
+		// normal connection failure instead of corrupting the SOCKS stream.
+		return net.IP(value).String(), true
+	default:
+		return "", false
+	}
+}
+
+func writeSOCKSReply(client net.Conn, reply byte) bool {
+	_, err := client.Write([]byte{5, reply, 0, 1, 0, 0, 0, 0, 0, 0})
+	return err == nil
+}

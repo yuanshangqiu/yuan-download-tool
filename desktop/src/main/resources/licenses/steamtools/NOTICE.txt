@@ -1,0 +1,1 @@
+SteamTools / Watt Toolkit 3.1.0 network acceleration concepts integrated into YunX.\r\nSource: BeyondDimension/SteamTools (GPL-3.0).\r\nOnly the network acceleration behavior was reimplemented; other SteamTools modules are not included.
